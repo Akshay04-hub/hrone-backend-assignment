@@ -1,0 +1,17 @@
+.env
+.env.*
+*.env
+!.env.example
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.dump
+*.tar.gz
+*.bak
+*.log
+.DS_Store
+Thumbs.db
+PROBLEM_STATEMENT.docx

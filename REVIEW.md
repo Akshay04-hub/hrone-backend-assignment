@@ -1,0 +1,39 @@
+# REVIEW.md
+
+List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+
+| # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
+|---|---|---|---|---|
+| 1 | `truncate_to_second` / `epoch_ms_to_datetime` (lines 68, 73) | Microseconds and sub-second milliseconds were preserved instead of truncating to whole seconds per R1. | Input ms `1783312500900` preserved `.900s`, causing fractional-second discrepancies in minute math. | Used `dt.replace(microsecond=0)` and `(ms // 1000) * 1000` to floor to whole seconds. |
+| 2 | `datetime_to_epoch_ms` (line 79) | Naive UTC datetimes from PyMongo were converted using `.timestamp()`, which applies local system timezone (e.g. IST +05:30). | Date `2026-07-06T03:58:00Z` serialized as `1783290480000` (shifted by 5.5 hours) on local machine. | Explicitly attached UTC timezone: `if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)` before `.timestamp()`. |
+| 3 | `is_overnight` (line 93) | Evaluated condition as `shift_end < shift_start` rather than `<=`. | Equal times (e.g. `18:30` to `18:30` representing 24-hr shifts) evaluated to `False` instead of `True` per R1. | Updated comparison logic to `shift_end <= shift_start`. |
+| 4 | `get_attendance_date` (line 98) | Overnight punch-ins before `shift_end` were assigned to the current calendar date instead of the previous day. | Overnight shift `22:00`–`06:00` with punch-in at `05:40 IST` on `2026-07-07` produced date `2026-07-07` instead of `2026-07-06`. | Checked if shift is overnight and punch time is strictly before `shift_end`; if so, subtracted 1 day: `cal_date - timedelta(days=1)`. |
+| 5 | `compute_late_minutes` (line 112) | Grace period check allowed `>= 10` min or computed late duration from grace end instead of `shift_start`. | Punch at `09:40:00` on `09:30` shift marked late, or `09:40:01` counted as 0 min late instead of 10. | Enforced `delta_seconds > 600` strictly; then floored elapsed minutes from `shift_start`: `int(delta_seconds // 60)`. |
+| 6 | `compute_work_hours` (line 129) | Used standard Python `round()` (banker's round-half-to-even) instead of decimal half-up rounding. | Work duration of `16290` seconds (`4.525` hrs) rounded down to `4.52` instead of `4.53` per R4. | Converted seconds to `Decimal` and quantized with `ROUND_HALF_UP`. |
+| 7 | `compute_half_day` (line 140) | Evaluated raw unrounded work hours and failed on null values. | Work duration of `4.499` hours before rounding was marked as half day, or `None` work hours raised errors. | Checked post-rounded `work_hours < 4.50`, safely returning `False` if `work_hours is None`. |
+| 8 | `compute_overtime` (line 147) | Assumed `shift_end` always falls on the same calendar day; counted durations under 30 minutes. | Overnight shift punch-out at `06:40` compared against previous day's `06:00` (yielding ~1480 min), or 25 min overtime counted. | Advanced `shift_end` date by 1 day for overnight shifts, and returned minutes only if `>= 30`, else `0`. |
+| 9 | `compute_monthly_working_days` (line 166) | Counted all calendar days including weekends and did not adjust for mid-month joiners. | Mid-month joiner on the 15th was credited with the full month, and Saturday/Sunday were counted as working days. | Bounded start date by `max(month_start, joined_date)` and iterated counting only Monday–Friday (`cur.isoweekday() <= 5`). |
+| 10 | `serialize_attendance_doc` (line 190) | Leaked MongoDB internal `_id` and failed to serialize nested datetimes in `history[].changes`. | Response JSON contained `_id: ObjectId(...)` and failed BSON datetime serialization inside history changes. | Filtered out `_id`, mapped top-level instants, and converted nested `from`/`to` datetimes into epoch milliseconds. |
+| 11 | `init_db_indexes` (line 34) | No indexes were created at startup, allowing duplicate records and causing full collection scans. | Concurrent punch-ins inserted duplicates; list and analytics queries defaulted to `COLLSCAN`. | Created idempotent indexes in lifespan: unique on `employees.emp_code`, unique on `attendance_logs.(emp_code, date)`, and compound query indexes. |
+| 12 | `GET /health` (line 280) | Returned static `{"status": "ok"}` without checking database readiness. | Endpoint returned 200 OK even when MongoDB was down or unreachable. | Pinged MongoDB with `db.command("ping")`, raising HTTP 503 if unavailable. |
+| 13 | `POST /employees` (lines 242, 289) | Accepted identical shift times, invalid `emp_code` formats, and crashed with 500 on duplicate employee. | Payload with `shift_start == shift_end` accepted; duplicate `emp_code` threw unhandled `DuplicateKeyError` (500). | Added model validator for shift times, regex pattern for `emp_code`, and caught `DuplicateKeyError` to return HTTP 409. |
+| 14 | `GET /employees` (line 306) | Missing sorting by `emp_code`, leaked `_id`, and returned `created_at` as BSON datetime. | Listing returned unsorted documents, exposed `_id`, and `created_at` was not an epoch ms integer. | Added `.sort("emp_code", 1)`, projection `{"_id": 0}`, and serialized `created_at` to epoch milliseconds. |
+| 15 | `POST /attendance/punch-in` (lines 258, 331) | Allowed invalid statuses (`ABSENT`/`LEAVE`), accepted seconds-looking timestamps, lacked 404 check, and had race condition. | Status `ABSENT` accepted at punch-in; missing employee created orphan document; concurrent punch-in threw 500. | Validated status regex `^(PRESENT|WFH|ON_DUTY)$`, validated epoch ms bounds, checked employee existence (404), and caught `DuplicateKeyError` (409). |
+| 16 | `GET /attendance` (line 374) | Missing date range validation (`date_from <= date_to`), lacked default sorting, and leaked `_id`. | Query with `date_from > date_to` returned 200 with empty list instead of 422; order was non-deterministic. | Added validation returning 422 if `date_from > date_to`, sorted by `date DESC, emp_code ASC`, and serialized all documents. |
+
+## Examined Behaviors That Are Not Defects
+
+1. **Plain string representation for dates (`YYYY-MM-DD`) and shift times (`HH:MM`)**:
+   Examined storing these fields as BSON strings rather than BSON dates or timestamps. This is **not** a defect; `DATA_MODEL.md` Section 1 explicitly specifies calendar dates and shift times as plain strings in IST to prevent implicit timezone conversions and drift across database drivers.
+
+2. **Weekend attendance records not incrementing `present_days`**:
+   Examined why weekend attendance logs contribute to `total_late_minutes` and `total_overtime_minutes` but do not increment `present_days`. This is **not** a defect; Rule R7 explicitly mandates that `present_days` counts only Monday–Friday records, while weekend logs still add to late and overtime totals.
+
+3. **Authority of stored derived values**:
+   Examined why analytics queries read stored `work_hours`, `late_minutes`, `overtime_minutes`, and `half_day` directly instead of recomputing them from `punch_in` and `punch_out`. This is **not** a defect; `DATA_MODEL.md` Section 3 mandates that stored derived values are authoritative, and seeded back-office records may not have raw punch instants.
+
+4. **Leaderboard returning more records than `limit` on cutoff ties**:
+   Examined whether `GET /analytics/leaderboard/late` should strictly truncate to `limit` rows. This is **not** a defect; `PROBLEM_STATEMENT.docx` and `openapi.yaml` specify that `limit` is applied to the computed rank (`rank <= limit`), not as a raw array slice. Tied employees share the same rank, and both must be returned to preserve fairness.
+
+5. **Exclusion of `_id` across all API schemas**:
+   Examined whether MongoDB's internal `_id` should ever be exposed or accepted. This is **not** a defect; `DATA_MODEL.md` and `openapi.yaml` mandate that `_id` is purely internal to MongoDB and must never appear in API requests or responses.
